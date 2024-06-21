@@ -1,0 +1,167 @@
+---
+title: "281FP Part 1"
+author: "Dailin Luo"
+date: "2024-04-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load in libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(vegan)# for adonis2
+library(sva)# for ComBat
+```
+
+## Data Pre-processing for Consistency
+
+```{r}
+## change the directory accordingly
+phenotype <- read.table("D:/BST281/FP/TCGA-OV.GDC_phenotype.tsv", sep="\t", header = T)
+FPKM <- read.table("D:/BST281/FP/TCGA-OV.htseq_fpkm.tsv", sep="\t", header = T)
+COUNT <- read.table("D:/BST281/FP/TCGA-OV.htseq_counts.tsv", sep="\t", header = T)
+## make the sample id format consistent among datasets 
+colnames(FPKM)[-1] <- gsub("\\.","-",colnames(FPKM)[-1])
+
+colnames(COUNT)[-1] <- gsub("\\.","-",colnames(COUNT)[-1])
+
+rownames(FPKM) <- FPKM$Ensembl_ID
+rownames(COUNT) <- COUNT$Ensembl_ID
+rownames(phenotype) <- phenotype$submitter_id.samples
+
+## find shared sample ids between FPKM, count, and phenotype
+ids.intersect.fpkm.count <- intersect(colnames(FPKM)[-1],colnames(COUNT)[-1])# FPKM and COUNT had all the same 379 samples
+ids.intersect <- intersect(ids.intersect.fpkm.count,rownames(phenotype))# FPKM and phenotype only had 189 shared samples
+
+FPKM.reorder <- FPKM[,ids.intersect]
+COUNT.reorder <- COUNT[,ids.intersect]
+phenotype.reorder <- phenotype[ids.intersect,]
+```
+
+## Data Cleaning
+```{r}
+## remove non-gene rows in COUNT
+COUNT.reorder <- COUNT.reorder[grepl("^ENSG",rownames(COUNT.reorder)),]
+## get raw count data
+COUNT.integer <- sapply(COUNT.reorder,function(x)as.integer(2^x-1))
+rownames(COUNT.integer) <- rownames(COUNT.reorder)
+## filter genes
+COUNT.filter1 <- COUNT.integer[rowSums(COUNT.integer==0)<0.7*ncol(COUNT.integer),]
+COUNT.filter <- COUNT.filter1[rowSums(COUNT.filter1>=10)>=1,]
+COUNT.filter <- as.data.frame(COUNT.filter)
+## filter genes
+FPKM.filter <- FPKM.reorder[rownames(COUNT.filter), ]
+
+## turn the batch number into a simpler format (a single integer)
+phenotype.reorder$batch <- as.factor(as.numeric(as.factor(phenotype.reorder$batch_number)))
+## select useful columns of phenotype
+phenotype.selcol <- phenotype.reorder[,c("sample_type.samples", "batch", "age_at_initial_pathologic_diagnosis", "race.demographic", "initial_pathologic_diagnosis_method")]
+colnames(phenotype.selcol) <- c("sample_type","batch","age_init","race","diag_method")
+phenotype.modified <- phenotype.selcol %>% 
+  mutate(tissue = ifelse(sample_type=="Solid Tissue Normal", "normal", "tumor"), tissue = as.factor(tissue),
+  race = case_when(
+    race=="american indian or alaska native"~1,
+    race=="asian"~2,
+    race=="black or african american"~3,
+    race=="white"~0,
+    .default = 4
+  ), race = as.factor(race),
+  ageCat = case_when(
+    age_init<=50~0,
+    age_init<=60~1,
+    age_init<=70~2,
+    age_init>70~3,
+    .default = 4
+  ), ageCat = as.factor(ageCat),
+  diag_method=case_when(
+    diag_method=="Tumor resection"~0,
+    diag_method=="Cytology (e.g. Peritoneal or pleural fluid)"~1,
+    diag_method=="Excisional Biopsy"~2,
+    diag_method=="Fine needle aspiration biopsy"~3,
+    diag_method=="Incisional Biopsy"~4,
+    .default = 5
+  ), diag_method = as.factor(diag_method)
+  )
+saveRDS(phenotype.modified,"phenotype.modified.rds")
+```
+
+
+## Pre-correction PCA
+```{r}
+set.seed(123)
+pca_pre <- prcomp(FPKM.filter, center = TRUE, scale. = TRUE)
+# Calculate the proportion of variance explained by each PC
+pca_pre_var <- (pca_pre$sdev)^2
+explained_variance_pre <- pca_pre_var / sum(pca_pre_var)
+
+# PCA visualization
+data.frame(phenotype.modified, pca_pre$rotation) %>% 
+ggplot(aes(x = PC1, y = PC2, shape = tissue, color = batch)) +
+  geom_point()+
+  labs(title = "PCA loadings of pre-correction feature table", 
+       x = paste("PC1 (", round(explained_variance_pre[1]*100,2), "%)", sep = ""),
+       y = paste("PC2 (", round(explained_variance_pre[2]*100,2), "%)", sep = ""))+
+  theme_minimal()
+```
+
+## COMBAT batch effect correction
+```{r}
+FPKM.combat <- ComBat(FPKM.filter, phenotype.modified$batch, par.prior = TRUE)
+FPKM.combat <- as.data.frame(FPKM.combat)
+saveRDS(FPKM.combat, "FPKM.combat.rds")
+```
+
+## Post-correction PCA
+```{r}
+set.seed(123)
+pca_post <- prcomp(FPKM.combat, center = TRUE, scale. = TRUE)
+# Calculate the proportion of variance explained by each PC
+pca_post_var <- (pca_post$sdev)^2
+explained_variance_post <- pca_post_var / sum(pca_post_var)
+
+# PCA visualization
+data.frame(phenotype.modified, pca_post$rotation) %>% 
+ggplot(aes(x = PC1, y = PC2, shape = tissue, color = batch)) +
+  geom_point()+
+  labs(title = "PCA loadings of post-correction feature table", 
+       x = paste("PC1 (", round(explained_variance_post[1]*100,2), "%)", sep = ""),
+       y = paste("PC2 (", round(explained_variance_post[2]*100,2), "%)", sep = ""))+
+  theme_minimal()
+```
+
+## PERMANOVA test
+```{r}
+permanova_before <- adonis2(t(FPKM.filter) ~ batch, data=phenotype.modified, method = "bray")
+permanova_before
+```
+```{r}
+permanova_after <- adonis2(t(FPKM.combat) ~ batch, data=phenotype.modified, method = "bray")
+permanova_after
+```
+
+## Unsupervised clustering
+```{r}
+gene_var <- apply(FPKM.combat, 1, var)
+top_gene <- names(gene_var)[order(gene_var,decreasing = TRUE)][1:(as.integer(0.05*length(gene_var)))]
+FPKM.topvar <- FPKM.combat[top_gene,]
+kmeans_res <- kmeans(FPKM.topvar, centers = 20)
+cluster_size <- kmeans_res$size
+barplot(sort(cluster_size, decreasing = T))
+```
+
+## Get a cluster of genes for functional enrichment analysis
+```{r}
+# get cluster assignment for each top high-variance gene
+cluster_assign <- kmeans_res$cluster
+table(cluster_assign)
+```
+```{r}
+genes.cluster12 <- names(cluster_assign[cluster_assign==12])
+genes.cluster12 <- sub("\\..*", "", genes.cluster12)
+write.csv(genes.cluster12,"ensg_12.txt",quote = F, row.names = F)
+```
+
